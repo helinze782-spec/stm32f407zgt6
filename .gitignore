@@ -1,0 +1,6 @@
+# Keil generated output
+Objects/
+Listings/
+
+# Keil user-specific settings
+*.uvguix.*
