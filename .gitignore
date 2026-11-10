@@ -4,3 +4,6 @@ Listings/
 
 # Keil user-specific settings
 *.uvguix.*
+
+# local backups (do not commit)
+backup_*/

@@ -1,231 +1,191 @@
-#include "motor.h"
+#include "stm32f4xx.h"                  // Device header
+#include "sys.h"
 
-typedef struct
+static u16 PWM_Period[MOTOR_COUNT];		//两个定时器的ARR
+static int Motor_Command[MOTOR_COUNT];		//上一次的PWM，用来判断换向
+
+/**************************************************************************
+Function: Get the real clock of the timer
+Input   : TIMx: TIM9 or TIM10
+Output  : Timer clock frequency
+函数功能：获取定时器实际时钟，APB预分频不为1时定时器时钟要乘2
+入口参数：TIMx：TIM9/TIM10
+返回  值：定时器时钟频率
+**************************************************************************/
+static u32 Get_Timer_Clock(TIM_TypeDef* TIMx)
 {
-	TIM_TypeDef *timer;			/* PWM定时器 */
-	GPIO_TypeDef *pwm_port;		/* PWM引脚端口 */
-	uint16_t pwm_pin;			/* PWM引脚 */
-	uint8_t pwm_pin_source;		/* PWM复用功能编号 */
-	uint8_t pwm_af;				/* PWM复用功能 */
-	GPIO_TypeDef *in1_port;		/* L298N方向脚1 */
-	uint16_t in1_pin;
-	GPIO_TypeDef *in2_port;		/* L298N方向脚2 */
-	uint16_t in2_pin;
-}MotorHardwareTypeDef;
+	RCC_ClocksTypeDef RCC_Clocks;
+	u32 pclk;
 
-/*
- * M1：PA2输出PWM，PD0/PD1控制方向。
- * M2：PF6输出PWM，PD2/PD3控制方向。
- */
-static const MotorHardwareTypeDef motor_hardware[MOTOR_COUNT]=
-{
-	{TIM9,GPIOA,GPIO_Pin_2,GPIO_PinSource2,GPIO_AF_TIM9,GPIOD,GPIO_Pin_0,GPIOD,GPIO_Pin_1},
-	{TIM10,GPIOF,GPIO_Pin_6,GPIO_PinSource6,GPIO_AF_TIM10,GPIOD,GPIO_Pin_2,GPIOD,GPIO_Pin_3}
-};
+	RCC_GetClocksFreq(&RCC_Clocks);
 
-static uint16_t motor_pwm_period[MOTOR_COUNT];
-static int16_t motor_command[MOTOR_COUNT];
-
-/* 获取定时器实际时钟。APB预分频不为1时，定时器时钟需要乘以2。 */
-static uint32_t Motor_GetTimerClock(TIM_TypeDef *timer)
-{
-	RCC_ClocksTypeDef clocks;
-	uint32_t pclk;
-
-	RCC_GetClocksFreq(&clocks);
-
-	if((timer==TIM9)||(timer==TIM10))
+	if((TIMx==TIM9)||(TIMx==TIM10))
 	{
-		pclk=clocks.PCLK2_Frequency;
-		if(clocks.PCLK2_Frequency==clocks.HCLK_Frequency)
+		pclk=RCC_Clocks.PCLK2_Frequency;
+		if(RCC_Clocks.PCLK2_Frequency==RCC_Clocks.HCLK_Frequency)
 			return pclk;
-		return pclk*2U;
+		return pclk*2;
 	}
 
-	pclk=clocks.PCLK1_Frequency;
-	if(clocks.PCLK1_Frequency==clocks.HCLK_Frequency)
+	pclk=RCC_Clocks.PCLK1_Frequency;
+	if(RCC_Clocks.PCLK1_Frequency==RCC_Clocks.HCLK_Frequency)
 		return pclk;
-	return pclk*2U;
+	return pclk*2;
 }
 
-static void Motor_SetCompare(MotorId motor,uint16_t compare)
+/**************************************************************************
+Function: PWM timer init
+Input   : TIMx: TIM9/TIM10, Period: auto reload value
+Output  : none
+函数功能：PWM定时器初始化
+入口参数：TIMx：TIM9/TIM10  Period：自动重装值
+返回  值：无
+**************************************************************************/
+static void PWM_Init(TIM_TypeDef* TIMx,u16 Period)
 {
-	/* 把比较值写入对应的PWM定时器，直接改变占空比。 */
-	if(motor>=MOTOR_COUNT)
-		return;
+	TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+	TIM_OCInitTypeDef TIM_OCInitStructure;
 
-	switch(motor)
-	{
-		case MOTOR_ID_1: TIM_SetCompare1(TIM9,compare); break;
-		case MOTOR_ID_2: TIM_SetCompare1(TIM10,compare); break;
-		default: break;
-	}
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);
+	TIM_TimeBaseStructure.TIM_Prescaler=0;			//预分频器，不分频
+	TIM_TimeBaseStructure.TIM_CounterMode=TIM_CounterMode_Up;	//向上计数
+	TIM_TimeBaseStructure.TIM_Period=Period;		//自动重装值
+	TIM_TimeBaseStructure.TIM_ClockDivision=TIM_CKD_DIV1;	//时钟分割
+	TIM_TimeBaseStructure.TIM_RepetitionCounter=0;
+	TIM_TimeBaseInit(TIMx,&TIM_TimeBaseStructure);
+
+	TIM_OCStructInit(&TIM_OCInitStructure);
+	TIM_OCInitStructure.TIM_OCMode=TIM_OCMode_PWM1;		//PWM模式1
+	TIM_OCInitStructure.TIM_OutputState=TIM_OutputState_Enable;	//比较输出使能
+	TIM_OCInitStructure.TIM_OCPolarity=TIM_OCPolarity_High;	//输出极性高
+	TIM_OCInitStructure.TIM_Pulse=0;
+	TIM_OC1Init(TIMx,&TIM_OCInitStructure);
+
+	TIM_OC1PreloadConfig(TIMx,TIM_OCPreload_Enable);	//CH1预装载使能
+	TIM_ARRPreloadConfig(TIMx,ENABLE);			//ARR预装载使能
+	TIM_SetCounter(TIMx,0);
+	TIM_Cmd(TIMx,ENABLE);					//使能定时器
 }
 
-static void Motor_SetDirection(MotorId motor,uint8_t forward)
-{
-	const MotorHardwareTypeDef *hardware;
-
-	if(motor>=MOTOR_COUNT)
-		return;
-
-	hardware=&motor_hardware[motor];
-
-	/* L298N方向：IN1=1、IN2=0正转；IN1=0、IN2=1反转。 */
-	if(forward)
-	{
-		GPIO_SetBits(hardware->in1_port,hardware->in1_pin);
-		GPIO_ResetBits(hardware->in2_port,hardware->in2_pin);
-	}
-	else
-	{
-		GPIO_ResetBits(hardware->in1_port,hardware->in1_pin);
-		GPIO_SetBits(hardware->in2_port,hardware->in2_pin);
-	}
-}
-
-static void Motor_PwmTimerInit(MotorId motor)
-{
-	TIM_TimeBaseInitTypeDef timer_init;
-	TIM_OCInitTypeDef oc_init;
-	const MotorHardwareTypeDef *hardware;
-	uint32_t timer_clock;
-
-	if(motor>=MOTOR_COUNT)
-		return;
-
-	hardware=&motor_hardware[motor];
-	timer_clock=Motor_GetTimerClock(hardware->timer);
-
-	/*
-	 * ARR = 定时器时钟 / PWM频率 - 1。
-	 * F407主频168MHz时，TIM9/TIM10的PWM周期约为25kHz。
-	 */
-	motor_pwm_period[motor]=(uint16_t)((timer_clock/MOTOR_PWM_FREQUENCY_HZ)-1U);
-
-	TIM_TimeBaseStructInit(&timer_init);
-	timer_init.TIM_Prescaler=0;
-	timer_init.TIM_CounterMode=TIM_CounterMode_Up;
-	timer_init.TIM_Period=motor_pwm_period[motor];
-	timer_init.TIM_ClockDivision=TIM_CKD_DIV1;
-	timer_init.TIM_RepetitionCounter=0;
-	TIM_TimeBaseInit(hardware->timer,&timer_init);
-
-	/* PWM1模式，计数小于比较值时输出高电平。 */
-	TIM_OCStructInit(&oc_init);
-	oc_init.TIM_OCMode=TIM_OCMode_PWM1;
-	oc_init.TIM_OutputState=TIM_OutputState_Enable;
-	oc_init.TIM_OCPolarity=TIM_OCPolarity_High;
-	oc_init.TIM_Pulse=0;
-	TIM_OC1Init(hardware->timer,&oc_init);
-	TIM_OC1PreloadConfig(hardware->timer,TIM_OCPreload_Enable);
-	TIM_ARRPreloadConfig(hardware->timer,ENABLE);
-	TIM_SetCounter(hardware->timer,0);
-	TIM_Cmd(hardware->timer,ENABLE);
-}
-
+/**************************************************************************
+Function: Motor init (direction pins, PWM pins, PWM timers)
+Input   : none
+Output  : none
+函数功能：电机初始化，方向脚、PWM脚、PWM定时器
+入口参数：无
+返回  值：无
+**************************************************************************/
 void Motor_Init(void)
 {
-	GPIO_InitTypeDef gpio_init;
-	MotorId motor;
+	GPIO_InitTypeDef GPIO_InitStructure;
+	u16 Period;
 
 	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOA|RCC_AHB1Periph_GPIOD|RCC_AHB1Periph_GPIOF,ENABLE);
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_TIM9|RCC_APB2Periph_TIM10,ENABLE);
 
-	/* 逐个初始化PWM复用脚和L298N方向脚。 */
-	for(motor=MOTOR_ID_1;motor<MOTOR_COUNT;motor++)
-	{
-		const MotorHardwareTypeDef *hardware=&motor_hardware[motor];
+	/* 方向脚 PD0~PD3 推挽输出，上电默认全低 */
+	GPIO_InitStructure.GPIO_Pin=GPIO_Pin_0|GPIO_Pin_1|GPIO_Pin_2|GPIO_Pin_3;
+	GPIO_InitStructure.GPIO_Mode=GPIO_Mode_OUT;
+	GPIO_InitStructure.GPIO_Speed=GPIO_Speed_2MHz;
+	GPIO_InitStructure.GPIO_OType=GPIO_OType_PP;
+	GPIO_InitStructure.GPIO_PuPd=GPIO_PuPd_DOWN;
+	GPIO_Init(GPIOD,&GPIO_InitStructure);
+	AIN1=0; AIN2=0; BIN1=0; BIN2=0;
 
-		GPIO_StructInit(&gpio_init);
-		gpio_init.GPIO_Pin=hardware->pwm_pin;
-		gpio_init.GPIO_Mode=GPIO_Mode_AF;
-		gpio_init.GPIO_Speed=GPIO_Speed_100MHz;
-		gpio_init.GPIO_OType=GPIO_OType_PP;
-		gpio_init.GPIO_PuPd=GPIO_PuPd_DOWN;
-		GPIO_Init(hardware->pwm_port,&gpio_init);
-		GPIO_PinAFConfig(hardware->pwm_port,hardware->pwm_pin_source,hardware->pwm_af);
+	/* 左轮PWM：PA2 = TIM9_CH1 */
+	GPIO_InitStructure.GPIO_Pin=GPIO_Pin_2;
+	GPIO_InitStructure.GPIO_Mode=GPIO_Mode_AF;
+	GPIO_InitStructure.GPIO_Speed=GPIO_Speed_100MHz;
+	GPIO_InitStructure.GPIO_OType=GPIO_OType_PP;
+	GPIO_InitStructure.GPIO_PuPd=GPIO_PuPd_DOWN;
+	GPIO_Init(GPIOA,&GPIO_InitStructure);
+	GPIO_PinAFConfig(GPIOA,GPIO_PinSource2,GPIO_AF_TIM9);
 
-		gpio_init.GPIO_Pin=hardware->in1_pin|hardware->in2_pin;
-		gpio_init.GPIO_Mode=GPIO_Mode_OUT;
-		gpio_init.GPIO_Speed=GPIO_Speed_2MHz;
-		gpio_init.GPIO_OType=GPIO_OType_PP;
-		gpio_init.GPIO_PuPd=GPIO_PuPd_DOWN;
-		GPIO_Init(hardware->in1_port,&gpio_init);
-		GPIO_ResetBits(hardware->in1_port,hardware->in1_pin);
-		GPIO_ResetBits(hardware->in2_port,hardware->in2_pin);
+	/* 右轮PWM：PF6 = TIM10_CH1 */
+	GPIO_InitStructure.GPIO_Pin=GPIO_Pin_6;
+	GPIO_Init(GPIOF,&GPIO_InitStructure);
+	GPIO_PinAFConfig(GPIOF,GPIO_PinSource6,GPIO_AF_TIM10);
 
-		/* 上电默认停止，避免电机立即转动。 */
-		motor_command[motor]=0;
-		Motor_PwmTimerInit(motor);
-	}
+	/* 左轮定时器：ARR = 定时器时钟/PWM频率 - 1 */
+	Period=(u16)(Get_Timer_Clock(TIM9)/MOTOR_PWM_FREQUENCY_HZ-1);
+	PWM_Period[0]=Period;
+	PWM_Init(TIM9,Period);
+
+	/* 右轮定时器 */
+	Period=(u16)(Get_Timer_Clock(TIM10)/MOTOR_PWM_FREQUENCY_HZ-1);
+	PWM_Period[1]=Period;
+	PWM_Init(TIM10,Period);
 }
 
-void Motor_SetSpeed(MotorId motor,int16_t speed_permille)
+/**************************************************************************
+Function: Output PWM to motor driver
+Input   : Motor_left: left PWM, Motor_right: right PWM (-1000~1000)
+Output  : none
+函数功能：把左右轮PWM（千分比）写到定时器和方向脚
+入口参数：Motor_left：左轮PWM  Motor_right：右轮PWM
+返回  值：无
+**************************************************************************/
+void Set_PWM(int Motor_left,int Motor_right)
 {
-	uint16_t compare,magnitude;
-	int16_t previous_command;
+	if(Motor_left>1000)  Motor_left=1000;
+	if(Motor_left<-1000) Motor_left=-1000;
+	if(Motor_right>1000) Motor_right=1000;
+	if(Motor_right<-1000)Motor_right=-1000;
 
-	if(motor>=MOTOR_COUNT)
-		return;
-
-	/* 速度指令范围限制为-1000~1000。 */
-	if(speed_permille>1000)
-		speed_permille=1000;
-	else if(speed_permille<-1000)
-		speed_permille=-1000;
-
-	previous_command=motor_command[motor];
-	motor_command[motor]=speed_permille;
-
-	/* 速度为0时关闭输出，电机自由滑行。 */
-	if(speed_permille==0)
+	/* 左轮 */
+	if(Motor_left==0)
 	{
-		Motor_Coast(motor);
-		return;
-	}
-
-	/* 正数正转，负数反转。换向前先撤掉PWM，减小反向冲击。 */
-	if(speed_permille>0)
-	{
-		magnitude=(uint16_t)speed_permille;
-		if(previous_command<0)
-			Motor_SetCompare(motor,0);
-		Motor_SetDirection(motor,1);
+		AIN1=0; AIN2=0; PWMA=0;				//滑行
 	}
 	else
 	{
-		magnitude=(uint16_t)(-speed_permille);
-		if(previous_command>0)
-			Motor_SetCompare(motor,0);
-		Motor_SetDirection(motor,0);
+		if(Motor_left*Motor_Command[0]<0) PWMA=0;	//换向前先撤掉PWM
+		if(Motor_left>0) {AIN1=1; AIN2=0;}		//正转
+		else		 {AIN1=0; AIN2=1;}		//反转
+		PWMA=(u16)(((u32)myabs(Motor_left)*((u32)PWM_Period[0]+1U)+999U)/1000U);
 	}
+	Motor_Command[0]=Motor_left;
 
-	/* 把0~1000千分比换算成定时器比较值。 */
-	compare=(uint16_t)(((uint32_t)magnitude*((uint32_t)motor_pwm_period[motor]+1U)+999U)/1000U);
-	Motor_SetCompare(motor,compare);
+	/* 右轮 */
+	if(Motor_right==0)
+	{
+		BIN1=0; BIN2=0; PWMB=0;
+	}
+	else
+	{
+		if(Motor_right*Motor_Command[1]<0) PWMB=0;
+		if(Motor_right>0) {BIN1=1; BIN2=0;}
+		else		  {BIN1=0; BIN2=1;}
+		PWMB=(u16)(((u32)myabs(Motor_right)*((u32)PWM_Period[1]+1U)+999U)/1000U);
+	}
+	Motor_Command[1]=Motor_right;
 }
 
-void Motor_Coast(MotorId motor)
-{
-	const MotorHardwareTypeDef *hardware;
-
-	if(motor>=MOTOR_COUNT)
-		return;
-
-	/* 滑行：PWM为0且两个方向输入都为低。 */
-	hardware=&motor_hardware[motor];
-	Motor_SetCompare(motor,0);
-	GPIO_ResetBits(hardware->in1_port,hardware->in1_pin);
-	GPIO_ResetBits(hardware->in2_port,hardware->in2_pin);
-	motor_command[motor]=0;
-}
-
+/**************************************************************************
+Function: Stop both motors
+Input   : none
+Output  : none
+函数功能：两路电机滑行停车
+入口参数：无
+返回  值：无
+**************************************************************************/
 void Motor_StopAll(void)
 {
-	MotorId motor;
-
-	for(motor=MOTOR_ID_1;motor<MOTOR_COUNT;motor++)
-		Motor_Coast(motor);
+	Set_PWM(0,0);
 }
 
+/**************************************************************************
+Function: Absolute value
+Input   : a
+Output  : |a|
+函数功能：取绝对值
+入口参数：a：输入值
+返回  值：绝对值
+**************************************************************************/
+int myabs(int a)
+{
+	int temp;
+	if(a<0) {temp=-a;}
+	else    {temp=a;}
+	return temp;
+}

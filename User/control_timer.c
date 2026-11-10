@@ -1,55 +1,49 @@
-#include "stm32f4xx.h"
-#include "control_timer.h"
-#include "encoder.h"
-#include "speed_control.h"
+#include "stm32f4xx.h"                  // Device header
+#include "sys.h"
 
-void Control_Timer_Init(void)
+/**************************************************************************
+Function: TIM7 init, 10ms interrupt
+Input   : none
+Output  : none
+函数功能：TIM7初始化，10ms中断一次，给速度环提供节拍
+入口参数：无
+返回  值：无
+**************************************************************************/
+void Timer_Init(void)
 {
-	TIM_TimeBaseInitTypeDef timer_init;
-	NVIC_InitTypeDef nvic_init;
-	RCC_ClocksTypeDef clocks;
-	uint32_t timer_clock;
-	uint16_t prescaler;
+	TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+	NVIC_InitTypeDef NVIC_InitStructure;
+	RCC_ClocksTypeDef RCC_Clocks;
+	u32 Timer_Clock;
+	u16 Prescaler;
 
 	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM7,ENABLE);
 
-	/* 获取TIM7实际定时器时钟。APB1预分频不为1时，定时器时钟乘以2。 */
-	RCC_GetClocksFreq(&clocks);
-	if(clocks.PCLK1_Frequency==clocks.HCLK_Frequency)
-		timer_clock=clocks.PCLK1_Frequency;
+	/* 获取TIM7实际定时器时钟，APB1预分频不为1时乘2 */
+	RCC_GetClocksFreq(&RCC_Clocks);
+	if(RCC_Clocks.PCLK1_Frequency==RCC_Clocks.HCLK_Frequency)
+		Timer_Clock=RCC_Clocks.PCLK1_Frequency;
 	else
-		timer_clock=clocks.PCLK1_Frequency*2U;
+		Timer_Clock=RCC_Clocks.PCLK1_Frequency*2;
 
-	/* 先分频到1MHz，再每10000个计数产生一次中断，即10ms。 */
-	prescaler=(uint16_t)(timer_clock/1000000U-1U);
+	/* 先分频到1MHz，再数10000个数，就是10ms */
+	Prescaler=(u16)(Timer_Clock/1000000-1);
 
-	TIM_TimeBaseStructInit(&timer_init);
-	timer_init.TIM_Prescaler=prescaler;
-	timer_init.TIM_Period=10000U-1U;
-	timer_init.TIM_ClockDivision=TIM_CKD_DIV1;
-	timer_init.TIM_CounterMode=TIM_CounterMode_Up;
-	TIM_TimeBaseInit(TIM7,&timer_init);
+	TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);
+	TIM_TimeBaseStructure.TIM_Prescaler=Prescaler;
+	TIM_TimeBaseStructure.TIM_Period=10000-1;
+	TIM_TimeBaseStructure.TIM_ClockDivision=TIM_CKD_DIV1;
+	TIM_TimeBaseStructure.TIM_CounterMode=TIM_CounterMode_Up;
+	TIM_TimeBaseInit(TIM7,&TIM_TimeBaseStructure);
 
 	TIM_ClearITPendingBit(TIM7,TIM_IT_Update);
 	TIM_ITConfig(TIM7,TIM_IT_Update,ENABLE);
 
-	nvic_init.NVIC_IRQChannel=TIM7_IRQn;
-	nvic_init.NVIC_IRQChannelPreemptionPriority=1;
-	nvic_init.NVIC_IRQChannelSubPriority=1;
-	nvic_init.NVIC_IRQChannelCmd=ENABLE;
-	NVIC_Init(&nvic_init);
+	NVIC_InitStructure.NVIC_IRQChannel=TIM7_IRQn;
+	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=1;
+	NVIC_InitStructure.NVIC_IRQChannelSubPriority=1;
+	NVIC_InitStructure.NVIC_IRQChannelCmd=ENABLE;
+	NVIC_Init(&NVIC_InitStructure);
 
 	TIM_Cmd(TIM7,ENABLE);
-}
-
-/* TIM7每10ms执行一次：先读编码器，再执行速度PI。 */
-void TIM7_IRQHandler(void)
-{
-	if(TIM_GetITStatus(TIM7,TIM_IT_Update)!=RESET)
-	{
-		TIM_ClearITPendingBit(TIM7,TIM_IT_Update);
-
-		Encoder_Update(MOTOR_CONTROL_PERIOD_MS);
-		SpeedControl_Update((float)MOTOR_CONTROL_PERIOD_MS/1000.0f);
-	}
 }

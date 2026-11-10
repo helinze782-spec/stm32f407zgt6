@@ -1,8 +1,8 @@
-#ifndef __CONTROL_TIMER_H
-#define __CONTROL_TIMER_H
+#ifndef __CONTROL_TIMER_H__
+#define __CONTROL_TIMER_H__
 
-#include "stm32f4xx.h"
+#include "motor_config.h"
 
-void Control_Timer_Init(void);
+void Timer_Init(void);
 
 #endif

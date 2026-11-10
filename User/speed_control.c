@@ -1,229 +1,299 @@
-/*
- * speed_control.c
- * 速度环：编码器测速 + PI + 启动补偿，由TIM7每10ms调用一次，两个电机各算一遍。
- *
- * 单位约定：
- *   转速  RPM
- *   PWM   千分比，1000 表示 100%
- *   时间  秒
- *
- * SpeedControl_Update里一次计算的顺序（从上往下就是执行顺序）：
- *   1. 读编码器转速，做方向修正和低通滤波，得到实际转速
- *   2. 目标为0而且电机已经停下 -> 直接滑行，本拍结束
- *   3. 算误差：目标转速 - 实际转速
- *   4. 累加积分（起步阶段先不积，避免电机还没转起来积分就积大了）
- *   5. 算PI输出：Kp*误差 + 积分
- *   6. 启动补偿：电机几乎静止时，PWM至少给到START_PWM，帮它冲过静摩擦死区
- *   7. 抗饱和，然后限幅，最后把PWM交给电机驱动
- */
+#include "stm32f4xx.h"                  // Device header
+#include "sys.h"
 
-#include "speed_control.h"
-#include "encoder.h"
-#include "motor.h"
-
-typedef struct
+/* 两个电机各自的启动补偿PWM */
+static const float Start_PWM[MOTOR_COUNT]=
 {
-	float target_rpm;			/* 目标转速 */
-	float measured_rpm;			/* 实际转速（低通滤波后） */
-	float integral;				/* PI积分项 */
-	float output;				/* 最终PWM输出，1000 = 100% */
-	uint8_t filter_initialized;	/* 第一次采样直接使用实测值，不做滤波 */
-}SpeedControlStateTypeDef;
-
-/*
- * 两个电机分别保存一套PI状态。
- * 故意不加static，方便在Keil的Watch窗口里直接看speed_state[0]、speed_state[1]。
- */
-SpeedControlStateTypeDef speed_state[MOTOR_COUNT];
-
-/* 编码器方向修正：正PWM时转速读出来是负的，就把对应的值改成-1.0f。 */
-static const float encoder_sign[MOTOR_COUNT]=
-{
-	SPEED_CONTROL_ENCODER_SIGN_1,
-	SPEED_CONTROL_ENCODER_SIGN_2
+	Start_PWM_1,
+	Start_PWM_2
 };
 
-/* 两个电机各自的启动补偿PWM，左轮和右轮可以分别设置。 */
-static const float start_pwm[MOTOR_COUNT]=
+/**************************************************************************
+Function: Float limit
+Input   : IN: input, max: upper, min: lower
+Output  : limited value
+函数功能：浮点限幅
+入口参数：IN：输入值  max：上限  min：下限
+返回  值：限幅后的值
+**************************************************************************/
+static float Speed_Limit(float IN,float max,float min)
 {
-	SPEED_CONTROL_START_PWM_1,
-	SPEED_CONTROL_START_PWM_2
-};
+	float OUT=IN;
+	if(OUT>max) OUT=max;
+	if(OUT<min) OUT=min;
+	return OUT;
+}
 
-/* 把value限制在minimum~maximum之间。 */
-static float SpeedControl_Clamp(float value,float minimum,float maximum)
+/**************************************************************************
+Function: Absolute value
+Input   : value
+Output  : |value|
+函数功能：取绝对值
+入口参数：value：输入值
+返回  值：绝对值
+**************************************************************************/
+static float Speed_Abs(float value)
 {
-	if(value>maximum)
-		return maximum;
-	if(value<minimum)
-		return minimum;
+	if(value<0) return -value;
 	return value;
 }
 
-/* 取绝对值。 */
-static float SpeedControl_Abs(float value)
+/**************************************************************************
+Function: TIM7 interrupt, speed loop every 10ms
+Input   : none
+Output  : none
+函数功能：TIM7中断，10ms一次，读编码器并做两路速度环
+入口参数：无
+返回  值：无
+**************************************************************************/
+void TIM7_IRQHandler(void)
 {
-	if(value<0)
-		return -value;
-	return value;
-}
-
-/* 把浮点PWM转换成-1000~1000的整数（四舍五入），电机驱动只认整数千分比。 */
-static int16_t SpeedControl_ToPermille(float value)
-{
-	if(value>=0)
-		return (int16_t)(value+0.5f);
-	return (int16_t)(value-0.5f);
-}
-
-void SpeedControl_Init(void)
-{
-	MotorId motor;
-
-	/* 清空PI状态并让电机停下。 */
-	for(motor=MOTOR_ID_1;motor<MOTOR_COUNT;motor++)
+	if(TIM_GetITStatus(TIM7,TIM_IT_Update)!=RESET)
 	{
-		speed_state[motor].target_rpm=0;
-		speed_state[motor].measured_rpm=0;
-		speed_state[motor].integral=0;
-		speed_state[motor].output=0;
-		speed_state[motor].filter_initialized=0;
+		TIM_ClearITPendingBit(TIM7,TIM_IT_Update);
+
+		/* 读两路编码器，前进为正 */
+		Encoder_Left=Encoder_Sign_1*Read_Encoder(2);		//左轮
+		Encoder_Right=Encoder_Sign_2*Read_Encoder(3);		//右轮
+		Get_Velocity_Form_Encoder(Encoder_Left,Encoder_Right);
+
+		/* 两路速度环 */
+		Motor_Left=Speed_Control(0);
+		Motor_Right=Speed_Control(1);
+		Motor_Left=PWM_Limit(Motor_Left,1000,-1000);
+		Motor_Right=PWM_Limit(Motor_Right,1000,-1000);
+
+		Set_PWM(Motor_Left,Motor_Right);
+	}
+}
+
+/**************************************************************************
+Function: Speed loop init
+Input   : none
+Output  : none
+函数功能：速度环初始化，清状态并让电机停下
+入口参数：无
+返回  值：无
+**************************************************************************/
+void Speed_Init(void)
+{
+	u8 i;
+
+	for(i=0;i<MOTOR_COUNT;i++)
+	{
+		Speed_Target[i]=0;
+		Speed_Measured[i]=0;
+		Speed_Integral[i]=0;
+		Speed_Output[i]=0;
+		Speed_Filter_Flag[i]=0;
+		Speed_Startup_Flag[i]=0;
+		Speed_Stall_Time[i]=0;
+		Speed_Stall_Fault[i]=0;
 	}
 
 	Motor_StopAll();
 }
 
-void SpeedControl_SetTargetRpm(MotorId motor,float target_rpm)
+/**************************************************************************
+Function: Set target speed
+Input   : motor: 0 left 1 right, rpm: target speed
+Output  : none
+函数功能：设置目标转速
+入口参数：motor：0左轮 1右轮  rpm：目标转速
+返回  值：无
+**************************************************************************/
+void Set_Target_Speed(u8 motor,float rpm)
 {
-	float old_target;
-	float new_target;
+	float old_target,new_target;
 
 	if(motor>=MOTOR_COUNT)
 		return;
 
-	/* 目标转速同样限制在配置的上限内。 */
-	new_target=SpeedControl_Clamp(target_rpm,-SPEED_CONTROL_TARGET_LIMIT_RPM,SPEED_CONTROL_TARGET_LIMIT_RPM);
+	/* 目标转速限制在配置的上限内 */
+	new_target=Speed_Limit(rpm,Target_Limit_RPM,-Target_Limit_RPM);
 
-	/*
-	 * 换向或者目标归零时清空积分。
-	 * 不清的话，旧积分会一直把电机往原来的方向拖，反向起步会明显发冲。
-	 */
-	old_target=speed_state[motor].target_rpm;
+	/* 重新设置目标时解除堵转锁存 */
+	if(Speed_Stall_Fault[motor]!=0)
+	{
+		Speed_Stall_Fault[motor]=0;
+		Speed_Stall_Time[motor]=0;
+		Speed_Startup_Flag[motor]=(new_target!=0);
+		Speed_Integral[motor]=0;
+	}
+
+	/* 换向或者目标归零时清空积分，不清的话旧积分会把电机往原来方向拖 */
+	old_target=Speed_Target[motor];
 	if(((old_target>0)&&(new_target<0))||((old_target<0)&&(new_target>0))||(new_target==0))
 	{
-		speed_state[motor].integral=0;
+		Speed_Integral[motor]=0;
+		Speed_Startup_Flag[motor]=(new_target!=0);
+		Speed_Stall_Time[motor]=0;
+		Speed_Stall_Fault[motor]=0;
+	}
+	else if((old_target==0)&&(new_target!=0))
+	{
+		Speed_Startup_Flag[motor]=1;
+		Speed_Stall_Time[motor]=0;
+		Speed_Stall_Fault[motor]=0;
 	}
 
-	speed_state[motor].target_rpm=new_target;
+	Speed_Target[motor]=new_target;
 }
 
-void SpeedControl_Update(float elapsed_seconds)
+/**************************************************************************
+Function: Speed PI control
+Input   : motor: 0 left 1 right
+Output  : PWM (per mille, -1000~1000)
+函数功能：速度环PI控制，10ms算一次
+入口参数：motor：0左轮 1右轮
+返回  值：PWM输出（千分比，-1000~1000）
+**************************************************************************/
+int Speed_Control(u8 motor)
 {
-	MotorId motor;
+	float raw_rpm;			//编码器直接算出来的转速
+	float error_rpm;		//目标转速-实际转速
+	float pi_output;		//PI输出，还没做启动补偿和限幅
+	float output;			//最终输出
+	u8 starting_up;			//启动补偿状态
 
-	if(elapsed_seconds<=0)
-		return;
+	if(motor>=MOTOR_COUNT)
+		return 0;
 
-	/* 两个电机用同一套流程，各算各的。 */
-	for(motor=MOTOR_ID_1;motor<MOTOR_COUNT;motor++)
+	/* 1.读编码器转速，一阶低通滤波压掉量化抖动 */
+	raw_rpm=Encoder_Speed[motor];
+	if(Speed_Filter_Flag[motor]==0)
 	{
-		SpeedControlStateTypeDef *state=&speed_state[motor];
-		float raw_rpm;			/* 编码器直接算出来的转速 */
-		float error_rpm;		/* 目标转速 - 实际转速 */
-		float pi_output;		/* PI算出来的PWM，还没做启动补偿和限幅 */
-		float output;			/* 最终发给电机的PWM */
-		uint8_t starting_up;	/* 1 = 正在起步，这一拍用启动补偿、不积分 */
-
-		/* ---------- 1. 读编码器转速 ---------- */
-		raw_rpm=Encoder_GetSpeedRpm(motor)*encoder_sign[motor];
-
-		/* 一阶低通滤波，压掉编码器量化带来的抖动。 */
-		if(state->filter_initialized==0)
-		{
-			state->measured_rpm=raw_rpm;
-			state->filter_initialized=1;
-		}
-		else
-		{
-			state->measured_rpm=SPEED_CONTROL_FILTER_ALPHA*raw_rpm
-			                   +(1.0f-SPEED_CONTROL_FILTER_ALPHA)*state->measured_rpm;
-		}
-
-		/* ---------- 2. 目标为0而且已经停下：滑行，本拍结束 ---------- */
-		if((state->target_rpm==0)&&(SpeedControl_Abs(state->measured_rpm)<=SPEED_CONTROL_ZERO_BAND_RPM))
-		{
-			state->integral=0;
-			state->output=0;
-			Motor_Coast(motor);
-			continue;
-		}
-
-		/* ---------- 3. 算误差 ---------- */
-		/* 误差 > 0：实际转速不够，要加大PWM；误差 < 0：实际转速过快，要减小PWM。 */
-		error_rpm=state->target_rpm-state->measured_rpm;
-
-		/* 判断是不是"正在起步"：目标不为0，而且电机几乎没有转。 */
-		starting_up=0;
-		if((state->target_rpm!=0)&&(SpeedControl_Abs(state->measured_rpm)<SPEED_CONTROL_START_RPM))
-			starting_up=1;
-
-		/* ---------- 4. 累加积分 ---------- */
-		/*
-		 * 起步阶段先不积分：这时候电机还没转起来，误差一直是满的，
-		 * 积分会一口气积得很大，等电机转起来以后就会冲过头。
-		 */
-		if(starting_up==0)
-		{
-			state->integral+=SPEED_CONTROL_KI*error_rpm*elapsed_seconds;
-			state->integral=SpeedControl_Clamp(state->integral,
-			                                   -SPEED_CONTROL_INTEGRAL_LIMIT,
-			                                    SPEED_CONTROL_INTEGRAL_LIMIT);
-		}
-
-		/* ---------- 5. 算PI输出 ---------- */
-		pi_output=(SPEED_CONTROL_KP*error_rpm)+state->integral;
-
-		/* ---------- 6. 启动补偿 ---------- */
-		/*
-		 * 电机几乎静止时，PI输出往往低于L298N和齿轮的静摩擦死区，电机必须用手转一下才动。
-		 * 所以起步阶段给PWM设一个下限START_PWM。
-		 * 到了正常调速阶段（starting_up=0）这一条不生效，不会影响转速精度。
-		 */
-		output=pi_output;
-		if(starting_up!=0)
-		{
-			if((state->target_rpm>0)&&(output<start_pwm[motor]))
-				output=start_pwm[motor];
-			else if((state->target_rpm<0)&&(output>-start_pwm[motor]))
-				output=-start_pwm[motor];
-		}
-
-		/* ---------- 7. 抗饱和 ---------- */
-		/*
-		 * PI输出顶到限幅以后，就不要再让积分继续涨了，否则积分会"饱和"：
-		 * 转速已经超过目标想往回收时，积分要慢慢退很久，电机会冲出去。
-		 * 这里把积分拉回到"刚好让PI输出等于限幅"的位置，下一拍接着正常算。
-		 *
-		 * 注意判断的是pi_output（PI自己的输出），不是叠加启动补偿后的output：
-		 * 用output判断的话，启动补偿一把PWM抬到限幅，积分就会被误改成很大的值。
-		 * 原来START_PWM=1000的时候，上电第一拍积分就从0跳到940，电机直接满速冲出去。
-		 */
-		if((pi_output>SPEED_CONTROL_OUTPUT_LIMIT)&&(error_rpm>0))
-			state->integral=SPEED_CONTROL_OUTPUT_LIMIT-(SPEED_CONTROL_KP*error_rpm);
-		else if((pi_output<-SPEED_CONTROL_OUTPUT_LIMIT)&&(error_rpm<0))
-			state->integral=-(SPEED_CONTROL_OUTPUT_LIMIT)-(SPEED_CONTROL_KP*error_rpm);
-
-		state->integral=SpeedControl_Clamp(state->integral,
-		                                   -SPEED_CONTROL_INTEGRAL_LIMIT,
-		                                    SPEED_CONTROL_INTEGRAL_LIMIT);
-
-		/* 目标为0但电机还在转时，PI会输出反向PWM做制动，这里限制制动幅度，保护驱动和电源。 */
-		if(state->target_rpm==0)
-			output=SpeedControl_Clamp(output,-SPEED_CONTROL_BRAKE_LIMIT,SPEED_CONTROL_BRAKE_LIMIT);
-
-		/* 最后统一按输出上限收一次，再交给电机驱动。 */
-		output=SpeedControl_Clamp(output,-SPEED_CONTROL_OUTPUT_LIMIT,SPEED_CONTROL_OUTPUT_LIMIT);
-		state->output=output;
-		Motor_SetSpeed(motor,SpeedControl_ToPermille(output));
+		Speed_Measured[motor]=raw_rpm;
+		Speed_Filter_Flag[motor]=1;
 	}
+	else
+	{
+		Speed_Measured[motor]=Filter_Alpha*raw_rpm
+		                     +(1.0f-Filter_Alpha)*Speed_Measured[motor];
+	}
+
+	/*
+	 * 堵转保护：先滑行Stall_Retry_MS，然后自动清故障重试。
+	 * 这样既能限制堵转时的持续电流，又不会因为一次误判就永久停机。
+	 */
+	if(Speed_Stall_Fault[motor]!=0)
+	{
+		Speed_Stall_Time[motor]+=(u16)(Control_Period*1000.0f);
+		if(Speed_Stall_Time[motor]>=Stall_Retry_MS)
+		{
+			Speed_Stall_Fault[motor]=0;
+			Speed_Stall_Time[motor]=0;
+			Speed_Startup_Flag[motor]=(Speed_Target[motor]!=0);
+			Speed_Integral[motor]=0;
+		}
+		Speed_Output[motor]=0;
+		return 0;
+	}
+
+	/* 2.目标为0而且已经停下：滑行，本拍结束 */
+	if((Speed_Target[motor]==0)&&(Speed_Abs(Speed_Measured[motor])<=Zero_Band_RPM))
+	{
+		Speed_Integral[motor]=0;
+		Speed_Output[motor]=0;
+		return 0;
+	}
+
+	/* 3.算误差 */
+	error_rpm=Speed_Target[motor]-Speed_Measured[motor];
+
+	/* 4.起步状态：目标不为0而且电机几乎没有转 */
+	if(Speed_Target[motor]==0)
+		Speed_Startup_Flag[motor]=0;
+	else if(Speed_Startup_Flag[motor]==0)
+	{
+		if(Speed_Abs(Speed_Measured[motor])<Start_RPM)
+			Speed_Startup_Flag[motor]=1;
+	}
+	starting_up=Speed_Startup_Flag[motor];
+
+	/* 5.累加积分，起步阶段也积，让PI逐步接管启动PWM下限 */
+	Speed_Integral[motor]+=Speed_Ki*error_rpm*Control_Period;
+	Speed_Integral[motor]=Speed_Limit(Speed_Integral[motor],Integral_Limit,-Integral_Limit);
+
+	/* 6.PI输出 */
+	pi_output=(Speed_Kp*error_rpm)+Speed_Integral[motor];
+
+	/* 7.启动补偿：起步阶段给PWM一个下限，帮它冲过静摩擦死区 */
+	output=pi_output;
+	if(starting_up!=0)
+	{
+		if((Speed_Target[motor]>0)&&(output<Start_PWM[motor]))
+			output=Start_PWM[motor];
+		else if((Speed_Target[motor]<0)&&(output>-Start_PWM[motor]))
+			output=-Start_PWM[motor];
+
+		/*
+		 * 转速超过退出阈值就退出启动补偿。
+		 * 退出这一拍把积分设成"刚好复现保底输出"的值，输出不跳变，
+		 * 之后由PI自然接管（无扰切换）。
+		 */
+		if(Speed_Abs(Speed_Measured[motor])>=Start_Exit_RPM)
+		{
+			if(Speed_Target[motor]>0)
+				Speed_Integral[motor]=Start_PWM[motor]-(Speed_Kp*error_rpm);
+			else
+				Speed_Integral[motor]=-Start_PWM[motor]-(Speed_Kp*error_rpm);
+			Speed_Integral[motor]=Speed_Limit(Speed_Integral[motor],Integral_Limit,-Integral_Limit);
+			Speed_Startup_Flag[motor]=0;
+		}
+	}
+
+	/* 8.堵转保护：连续低速达到阈值后停机，避免堵转时持续大电流 */
+	if((Speed_Abs(Speed_Target[motor])>=Stall_Target_RPM)
+	   &&(Speed_Abs(Speed_Measured[motor])<Stall_Speed_RPM))
+	{
+		u32 stall_ms=(u32)Speed_Stall_Time[motor]+(u32)(Control_Period*1000.0f);
+		if(stall_ms>=Stall_Time_MS)
+		{
+			Speed_Stall_Fault[motor]=1;
+			Speed_Stall_Time[motor]=0;		//重新计时，用于自动重试
+			Speed_Integral[motor]=0;
+			Speed_Output[motor]=0;
+			return 0;
+		}
+		Speed_Stall_Time[motor]=(u16)stall_ms;
+	}
+	else
+		Speed_Stall_Time[motor]=0;
+
+	/* 9.抗饱和：PI输出顶到限幅后把积分拉回来，判断用pi_output而不是output */
+	if((pi_output>Output_Limit)&&(error_rpm>0))
+		Speed_Integral[motor]=Output_Limit-(Speed_Kp*error_rpm);
+	else if((pi_output<-Output_Limit)&&(error_rpm<0))
+		Speed_Integral[motor]=-Output_Limit-(Speed_Kp*error_rpm);
+
+	Speed_Integral[motor]=Speed_Limit(Speed_Integral[motor],Integral_Limit,-Integral_Limit);
+
+	/* 目标为0但电机还在转时，限制制动幅度，保护L298N和电源 */
+	if(Speed_Target[motor]==0)
+		output=Speed_Limit(output,Brake_Limit,-Brake_Limit);
+
+	/* 10.限幅输出 */
+	output=Speed_Limit(output,Output_Limit,-Output_Limit);
+	Speed_Output[motor]=output;
+
+	/* 千分比四舍五入 */
+	if(output>=0) return (int)(output+0.5f);
+	return (int)(output-0.5f);
+}
+
+/**************************************************************************
+Function: Integer limit
+Input   : IN: input, max: upper, min: lower
+Output  : limited value
+函数功能：整数限幅
+入口参数：IN：输入值  max：上限  min：下限
+返回  值：限幅后的值
+**************************************************************************/
+int PWM_Limit(int IN,int max,int min)
+{
+	int OUT=IN;
+	if(OUT>max) OUT=max;
+	if(OUT<min) OUT=min;
+	return OUT;
 }

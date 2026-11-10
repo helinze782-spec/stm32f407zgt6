@@ -158,12 +158,12 @@
         <Ww>
           <count>0</count>
           <WinNumber>1</WinNumber>
-          <ItemText>Debug_PWM_1</ItemText>
+          <ItemText>Encoder_Left</ItemText>
         </Ww>
         <Ww>
           <count>1</count>
           <WinNumber>1</WinNumber>
-          <ItemText>Debug_PWM_2</ItemText>
+          <ItemText>Encoder_Right</ItemText>
         </Ww>
         <Ww>
           <count>2</count>
